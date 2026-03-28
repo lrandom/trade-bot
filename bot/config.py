@@ -29,6 +29,9 @@ class Settings:
     binance_testnet: bool = field(
         default_factory=lambda: os.getenv("BINANCE_TESTNET", "true").lower() == "true"
     )
+    trading_symbol: str = field(
+        default_factory=lambda: os.getenv("TRADING_SYMBOL", "XAUUSDT").upper()
+    )
 
     # ------------------------------------------------------------------
     # LLM — default provider / model
@@ -72,6 +75,12 @@ class Settings:
     )
     llm_model_scalp: str = field(
         default_factory=lambda: os.getenv("LLM_MODEL_SCALP", "")
+    )
+    llm_provider_manage: str = field(
+        default_factory=lambda: os.getenv("LLM_PROVIDER_MANAGE", "")
+    )
+    llm_model_manage: str = field(
+        default_factory=lambda: os.getenv("LLM_MODEL_MANAGE", "")
     )
 
     # ------------------------------------------------------------------

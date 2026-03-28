@@ -45,6 +45,14 @@ def create_provider(provider: str, model: str) -> BaseLLMProvider:
             )
 
 
+def get_provider_for_manage(mode: str) -> BaseLLMProvider:
+    """Provider for manage_trade() — uses LLM_PROVIDER_MANAGE/LLM_MODEL_MANAGE if set,
+    falling back to the current mode's provider."""
+    provider = settings.llm_provider_manage or settings.get_llm_provider_for_mode(mode)
+    model = settings.llm_model_manage or settings.get_llm_model_for_mode(mode)
+    return create_provider(provider, model)
+
+
 def get_provider_for_mode(mode: str) -> BaseLLMProvider:
     """Return the appropriate provider for a given trading mode.
 

@@ -8,6 +8,7 @@ import uuid
 
 from loguru import logger
 
+from bot.config import settings
 from bot.database import db_execute, db_fetchall, db_fetchone
 from bot.trader.base import BaseTrader, Order
 
@@ -29,8 +30,8 @@ class MockTrader(BaseTrader):
         await db_execute(
             """INSERT INTO paper_orders
                (id, signal_id, symbol, side, entry, stop_loss, tp1, tp2, tp3, size, mode, status)
-               VALUES (?, ?, 'XAUUSDT', ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
-            order_id, signal_id, action, entry, sl, tp1, tp2, tp3, size, mode,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+            order_id, signal_id, settings.trading_symbol, action, entry, sl, tp1, tp2, tp3, size, mode,
         )
 
         logger.info(
@@ -47,7 +48,7 @@ class MockTrader(BaseTrader):
 
         return Order(
             id=order_id,
-            symbol="XAUUSDT",
+            symbol=settings.trading_symbol,
             side=action,
             entry=entry,
             stop_loss=sl,
@@ -97,7 +98,7 @@ class MockTrader(BaseTrader):
             result.append(
                 Order(
                     id=str(r["id"]),
-                    symbol="XAUUSDT",
+                    symbol=r.get("symbol", settings.trading_symbol),
                     side=r.get("side", "BUY"),
                     entry=float(r.get("entry", 0)),
                     stop_loss=float(r.get("stop_loss", 0)),

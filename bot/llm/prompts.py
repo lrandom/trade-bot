@@ -22,6 +22,15 @@ from bot.llm.models import HTFAnalysis, LTFAnalysis, MTFAnalysis, MacroAnalysis
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _asset_label(symbol: str) -> str:
+    """Return a human-friendly asset name from a Binance Futures symbol."""
+    base = symbol.upper().replace("USDT", "").replace("BUSD", "").replace("PERP", "")
+    return {
+        "XAU": "Gold", "BTC": "Bitcoin", "ETH": "Ethereum",
+        "BNB": "BNB", "SOL": "Solana", "XRP": "XRP",
+    }.get(base, base)
+
+
 def _safe_float(value, precision: int = 2) -> str:
     """Format a numeric value safely, returning 'N/A' for None."""
     if value is None:
@@ -89,9 +98,11 @@ def build_macro_prompt(snapshot: MarketSnapshot) -> tuple[str, str]:
     Returns:
         (system, user) prompt strings.
     """
+    asset = _asset_label(snapshot.symbol)
+    pair = snapshot.symbol.replace("USDT", "")
     system = (
-        "You are a gold market macro analyst. Analyze macroeconomic data and "
-        "give directional bias for XAUUSD. Be concise and decisive.\n\n"
+        f"You are a {asset} market macro analyst. Analyze macroeconomic data and "
+        f"give directional bias for {pair}. Be concise and decisive.\n\n"
         "Respond with EXACTLY this format:\n"
         "BIAS: [BULLISH|BEARISH|NEUTRAL]\n"
         "CONFIDENCE: [0-100]\n"
@@ -113,7 +124,7 @@ def build_macro_prompt(snapshot: MarketSnapshot) -> tuple[str, str]:
         f"## Macro Data ({snapshot.timestamp.strftime('%Y-%m-%d')})\n"
         f"Fed Funds Rate: {fed_rate}\n"
         f"10Y-2Y Treasury Spread: {yield_spread}\n"
-        f"Current XAUUSD: {snapshot.mark_price:.2f}\n\n"
+        f"Current {pair}: {snapshot.mark_price:.2f}\n\n"
         f"## Recent Headlines:\n"
         f"{headlines}\n\n"
         f"Analyze and provide BIAS, CONFIDENCE, RISKS."
@@ -135,9 +146,11 @@ def build_htf_prompt(snapshot: MarketSnapshot) -> tuple[str, str]:
     Returns:
         (system, user) prompt strings.
     """
+    asset = _asset_label(snapshot.symbol)
+    pair = snapshot.symbol.replace("USDT", "")
     system = (
-        "You are a gold futures analyst specializing in higher timeframe structure. "
-        "Identify the DOMINANT WAVE and directional bias for XAUUSD. "
+        f"You are a {asset} futures analyst specializing in higher timeframe structure. "
+        f"Identify the DOMINANT WAVE and directional bias for {pair}. "
         "This bias GATES all lower timeframe entries — be decisive.\n\n"
         "Respond with EXACTLY this format:\n"
         "HTF_BIAS: [BUY-ONLY|SELL-ONLY|NEUTRAL]\n"
@@ -156,7 +169,7 @@ def build_htf_prompt(snapshot: MarketSnapshot) -> tuple[str, str]:
     res_str = str(snapshot.resistance_levels[:2]) if snapshot.resistance_levels else "[]"
 
     user = (
-        f"## XAUUSD Higher Timeframe Analysis\n"
+        f"## {pair} Higher Timeframe Analysis\n"
         f"Current price: {snapshot.mark_price:.2f}\n\n"
         f"{w1}\n\n"
         f"{d1}\n"
@@ -288,8 +301,9 @@ def build_signal_prompt(
     sl_mult = mode_cfg.get("atr_sl_mult", 1.5)
     sl_dist = atr * sl_mult
 
+    asset = _asset_label(snapshot.symbol)
     system = (
-        "You are a gold futures signal generator. All three timeframes "
+        f"You are a {asset} futures signal generator. All three timeframes "
         "(HTF/MTF/LTF) confirmed alignment. Generate precise entry parameters. "
         "Direction is LOCKED by HTF bias — do not contradict it. "
         "Use generate_trading_signal tool."
@@ -332,8 +346,9 @@ def build_management_prompt(
     Returns:
         (system, user) prompt strings.
     """
+    asset = _asset_label(snapshot.symbol)
     system = (
-        "You are a gold futures trade manager. Evaluate whether to hold, exit, "
+        f"You are a {asset} futures trade manager. Evaluate whether to hold, exit, "
         "or adjust SL. Capital preservation is primary. Use manage_trade tool."
     )
 

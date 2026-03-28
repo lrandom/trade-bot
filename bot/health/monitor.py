@@ -131,7 +131,8 @@ class HealthMonitor:
         try:
             from bot.data.binance_client import get_client
             client = await get_client()
-            await client.get_symbol_ticker(symbol="XAUUSDT")
+            from bot.config import settings
+            await client.get_symbol_ticker(symbol=settings.trading_symbol)
             latency = (time.time() - start) * 1000
             return ComponentStatus("binance", ok=True, latency_ms=latency)
         except Exception as e:

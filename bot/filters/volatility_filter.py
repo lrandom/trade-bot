@@ -33,7 +33,8 @@ class VolatilityFilter:
             from bot.data.ohlcv import fetch_ohlcv
             from bot.data.indicators import compute_indicators
 
-            df = await fetch_ohlcv("XAUUSDT", tf, limit=30)
+            from bot.config import settings
+            df = await fetch_ohlcv(settings.trading_symbol, tf, limit=30)
             df = compute_indicators(df)
 
             # Locate the ATR column produced by pandas-ta (ATRr_14 by default)

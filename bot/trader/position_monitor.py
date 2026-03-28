@@ -157,7 +157,8 @@ async def _fetch_current_price() -> float:
     try:
         from bot.data.binance_client import get_client
         client = await get_client()
-        ticker = await client.get_symbol_ticker(symbol="XAUUSDT")
+        from bot.config import settings
+        ticker = await client.get_symbol_ticker(symbol=settings.trading_symbol)
         return float(ticker.get("price", 0))
     except Exception as e:
         logger.warning(f"Could not fetch current price: {e}")

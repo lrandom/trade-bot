@@ -10,6 +10,7 @@ from bot.data.support_resistance import find_levels
 from bot.data.macro import fetch_fred_data, fetch_news
 from bot.data.binance_client import get_client
 from bot.modes.config import MODES
+from bot.config import settings
 
 
 @dataclass
@@ -93,7 +94,7 @@ async def build_snapshot(mode: str) -> MarketSnapshot:
     client = await get_client()
 
     # ── Fetch all TFs concurrently ────────────────────────────────────────────
-    fetch_tasks = [fetch_ohlcv("XAUUSDT", tf) for tf in all_tfs]
+    fetch_tasks = [fetch_ohlcv(settings.trading_symbol, tf) for tf in all_tfs]
     fetch_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
 
     timeframes: Dict[str, pd.DataFrame] = {}
@@ -111,7 +112,7 @@ async def build_snapshot(mode: str) -> MarketSnapshot:
     # ── Mark price ────────────────────────────────────────────────────────────
     mark_price = 0.0
     try:
-        ticker = await client.futures_mark_price(symbol="XAUUSDT")
+        ticker = await client.futures_mark_price(symbol=settings.trading_symbol)
         mark_price = float(ticker["markPrice"])
     except Exception:
         pass
@@ -135,7 +136,7 @@ async def build_snapshot(mode: str) -> MarketSnapshot:
     from bot.utils.timezone import utc_now
 
     return MarketSnapshot(
-        symbol="XAUUSDT",
+        symbol=settings.trading_symbol,
         timestamp=utc_now(),
         mode=mode,
         timeframes=timeframes,

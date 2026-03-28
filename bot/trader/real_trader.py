@@ -8,6 +8,7 @@ import asyncio
 
 from loguru import logger
 
+from bot.config import settings
 from bot.data.binance_client import get_client
 from bot.trader.base import BaseTrader, Order
 
@@ -61,12 +62,12 @@ class RealTrader(BaseTrader):
             try:
                 # 1. Set leverage
                 await client.futures_change_leverage(
-                    symbol="XAUUSDT", leverage=leverage
+                    symbol=settings.trading_symbol, leverage=leverage
                 )
 
                 # 2. Market entry
                 entry_order = await client.futures_create_order(
-                    symbol="XAUUSDT",
+                    symbol=settings.trading_symbol,
                     side=binance_side,
                     type="MARKET",
                     quantity=round(size, 3),
@@ -79,7 +80,7 @@ class RealTrader(BaseTrader):
                 # 3. Stop-loss order
                 if sl > 0:
                     await client.futures_create_order(
-                        symbol="XAUUSDT",
+                        symbol=settings.trading_symbol,
                         side=sl_side,
                         type="STOP_MARKET",
                         stopPrice=sl,
@@ -92,7 +93,7 @@ class RealTrader(BaseTrader):
                 )
                 return Order(
                     id=order_id,
-                    symbol="XAUUSDT",
+                    symbol=settings.trading_symbol,
                     side=action,
                     entry=fill_price,
                     stop_loss=sl,
@@ -116,14 +117,14 @@ class RealTrader(BaseTrader):
         """Close entire position at market. Returns approximate unrealized PnL."""
         client = await get_client()
         try:
-            positions = await client.futures_position_information(symbol="XAUUSDT")
+            positions = await client.futures_position_information(symbol=settings.trading_symbol)
             for pos in positions:
                 amt = float(pos.get("positionAmt", 0))
                 if abs(amt) < 0.001:
                     continue
                 side = "SELL" if amt > 0 else "BUY"
                 await client.futures_create_order(
-                    symbol="XAUUSDT",
+                    symbol=settings.trading_symbol,
                     side=side,
                     type="MARKET",
                     quantity=round(abs(amt), 3),
@@ -143,7 +144,7 @@ class RealTrader(BaseTrader):
         """Return all open Binance Futures positions for XAUUSDT."""
         client = await get_client()
         try:
-            positions = await client.futures_position_information(symbol="XAUUSDT")
+            positions = await client.futures_position_information(symbol=settings.trading_symbol)
             result: list[Order] = []
             for pos in positions:
                 amt = float(pos.get("positionAmt", 0))
@@ -151,8 +152,8 @@ class RealTrader(BaseTrader):
                     continue
                 result.append(
                     Order(
-                        id=str(pos.get("symbol", "XAUUSDT")),
-                        symbol="XAUUSDT",
+                        id=str(pos.get("symbol", settings.trading_symbol)),
+                        symbol=settings.trading_symbol,
                         side="BUY" if amt > 0 else "SELL",
                         entry=float(pos.get("entryPrice", 0)),
                         stop_loss=0.0,

@@ -79,7 +79,7 @@ async def _ws_analysis_task() -> None:
     from bot.data.binance_client import get_client
     from bot.data.websocket_feed import CandleBuffer
     client = await get_client()
-    buf = CandleBuffer("XAUUSDT", "1m")
+    buf = CandleBuffer(settings.trading_symbol, "1m")
     buf.on_close = lambda: asyncio.create_task(_run_analysis_cycle("scalp"))
     await buf.start(client)
 

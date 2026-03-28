@@ -273,9 +273,11 @@ class LLMEngine:
             ManagementDecision with decision=HOLD|EXIT|ADJUST_SL.
             Defaults to HOLD on any API error.
         """
+        from bot.llm.providers.factory import get_provider_for_manage
+        manage_provider = get_provider_for_manage(self.mode)
         system, user = build_management_prompt(position, snapshot)
         try:
-            resp = await self.provider.complete_structured(
+            resp = await manage_provider.complete_structured(
                 system, user, MANAGEMENT_TOOL
             )
             logger.debug(
