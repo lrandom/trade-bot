@@ -313,7 +313,7 @@ class LLMEngine:
     def _parse_macro(self, text: str) -> MacroAnalysis:
         bias = self._extract(text, r"BIAS:\s*(\w+)", "NEUTRAL")
         conf = int(self._extract(text, r"CONFIDENCE:\s*(\d+)", "50"))
-        risks = self._extract(text, r"RISKS:\s*(.+)", "N/A")
+        risks = self._extract(text, r"RISKS:\s*([^\n]+)", "N/A")
         return MacroAnalysis(
             bias=bias.upper(),
             confidence=min(max(conf, 0), 100),
@@ -323,7 +323,7 @@ class LLMEngine:
 
     def _parse_htf(self, text: str) -> HTFAnalysis:
         bias = self._extract(text, r"HTF_BIAS:\s*([\w-]+)", "NEUTRAL")
-        wave = self._extract(text, r"WAVE_POSITION:\s*(.+)", "unknown")
+        wave = self._extract(text, r"WAVE_POSITION:\s*([^\n]+)", "unknown")
         sup_str = self._extract(
             text, r"KEY_SUPPORT:\s*([0-9.,\s]+)", ""
         )
@@ -374,7 +374,7 @@ class LLMEngine:
             high = float(parts[1])
         except (ValueError, IndexError):
             high = low
-        reasoning = self._extract(text, r"REASONING:\s*(.+)", "N/A")
+        reasoning = self._extract(text, r"REASONING:\s*([^\n]+)", "N/A")
         return MTFAnalysis(
             confirms_htf=confirms,
             structure=structure,
@@ -388,14 +388,15 @@ class LLMEngine:
         trigger = (
             self._extract(text, r"ENTRY_TRIGGER:\s*(\w+)", "NO").upper() == "YES"
         )
-        pattern = self._extract(text, r"CANDLE_PATTERN:\s*(.+)", "none")
+        # Use [^\n]+ to avoid DOTALL capturing across multiple lines into REASONING
+        pattern = self._extract(text, r"CANDLE_PATTERN:\s*([^\n]+)", "none")
         try:
             entry = float(
                 self._extract(text, r"ENTRY_PRICE:\s*([0-9.]+)", "0")
             )
         except ValueError:
             entry = 0.0
-        reasoning = self._extract(text, r"REASONING:\s*(.+)", "N/A")
+        reasoning = self._extract(text, r"REASONING:\s*([^\n]+)", "N/A")
         return LTFAnalysis(
             entry_trigger=trigger,
             candle_pattern=pattern.strip().lower(),

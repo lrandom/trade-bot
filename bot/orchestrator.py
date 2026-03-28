@@ -53,6 +53,8 @@ from bot.utils.timezone import fmt_ict, utc_now
 _shutdown_event: asyncio.Event | None = None
 _scheduler: AsyncIOScheduler | None = None
 _health_monitor: HealthMonitor | None = None
+_ws_task: asyncio.Task | None = None       # track WebSocket task for scalp mode
+_current_interval: int | None = None       # track current scheduler interval
 
 
 def _handle_signal(sig):
@@ -66,14 +68,84 @@ def _handle_signal(sig):
 # Analysis cycle
 # ---------------------------------------------------------------------------
 
-async def trigger_analysis() -> None:
+async def _analysis_job_fn() -> None:
+    """Module-level analysis job for APScheduler (interval-based modes)."""
+    current_mode = await get_current_mode()
+    await _run_analysis_cycle(current_mode)
+
+
+async def _ws_analysis_task() -> None:
+    """WebSocket feed — triggers analysis on every closed 1m candle (scalp mode)."""
+    from bot.data.binance_client import get_client
+    from bot.data.websocket_feed import CandleBuffer
+    client = await get_client()
+    buf = CandleBuffer("XAUUSDT", "1m")
+    buf.on_close = lambda: asyncio.create_task(_run_analysis_cycle("scalp"))
+    await buf.start(client)
+
+
+async def apply_mode_switch(new_mode: str) -> str:
+    """Apply scheduler/WebSocket changes immediately after a mode switch.
+
+    Should be called right after set_mode() to sync the scheduler with the
+    new mode. Returns a human-readable description of the new interval.
+    """
+    global _ws_task
+
+    from bot.modes.config import get_mode_config
+    mode_cfg = get_mode_config(new_mode)
+    analysis_trigger = mode_cfg.get("analysis_trigger", "interval")
+    interval_minutes = mode_cfg.get("interval_minutes")
+
+    if _scheduler is None:
+        return "Scheduler chưa khởi động"
+
+    if analysis_trigger == "interval" and interval_minutes:
+        # Interval-based (swing, intraday): reschedule or add job
+        if _scheduler.get_job("analysis"):
+            _scheduler.reschedule_job(
+                "analysis",
+                trigger="interval",
+                minutes=interval_minutes,
+            )
+        else:
+            _scheduler.add_job(
+                _analysis_job_fn,
+                trigger="interval",
+                minutes=interval_minutes,
+                id="analysis",
+                max_instances=1,
+                coalesce=True,
+            )
+        # Stop WebSocket if running (switching away from scalp)
+        if _ws_task and not _ws_task.done():
+            _ws_task.cancel()
+            _ws_task = None
+        return f"Phân tích mỗi {interval_minutes} phút"
+
+    elif analysis_trigger == "candle_close":
+        # Scalp: remove interval job, start WebSocket
+        if _scheduler.get_job("analysis"):
+            _scheduler.remove_job("analysis")
+        if _ws_task is None or _ws_task.done():
+            _ws_task = asyncio.create_task(_ws_analysis_task(), name="websocket")
+        return "Real-time (WebSocket 1m candle)"
+
+    return "Mode đã cập nhật"
+
+
+async def trigger_analysis() -> "TradingSignal | None":
     """Called by /signal Telegram command to run one immediate cycle."""
     mode = await get_current_mode()
-    await _run_analysis_cycle(mode)
+    return await _run_analysis_cycle(mode)
 
 
-async def _run_analysis_cycle(mode: str) -> None:
-    """Full analysis pipeline: filter → snapshot → LLM → risk → save/execute."""
+async def _run_analysis_cycle(mode: str) -> "TradingSignal | None":
+    """Full analysis pipeline: filter → snapshot → LLM → risk → save/execute.
+
+    Returns the TradingSignal produced (including HOLD), or None if blocked
+    by a pre-LLM filter (ATR spike, etc.).
+    """
     logger.info(f"=== Analysis cycle start | mode={mode} ===")
 
     try:
@@ -82,7 +154,7 @@ async def _run_analysis_cycle(mode: str) -> None:
         atr_result = await filter_chain.vol_filter.check_atr_spike(mode)
         if not atr_result.passed:
             logger.info(f"ATR filter blocked — {atr_result.reason}")
-            return
+            return None
 
         # Build market snapshot
         snapshot = await build_snapshot(mode)
@@ -93,7 +165,7 @@ async def _run_analysis_cycle(mode: str) -> None:
 
         if signal.action == "HOLD":
             logger.info(f"Signal: HOLD — {signal.reasoning[:80]}")
-            return
+            return signal
 
         logger.info(f"Signal: {signal.action} @ {signal.entry_price} (conf={signal.confidence}%)")
 
@@ -106,7 +178,8 @@ async def _run_analysis_cycle(mode: str) -> None:
         corr_result = await filter_chain.corr_filter.check_correlation(signal_dict)
         if not corr_result.passed:
             logger.info(f"Correlation filter blocked — {corr_result.reason}")
-            return
+            signal.reasoning = f"[Corr filter] {corr_result.reason}"
+            return signal
         # Adjust confidence from correlation
         adjusted_confidence = corr_result.adjusted_confidence or signal.confidence
 
@@ -116,7 +189,8 @@ async def _run_analysis_cycle(mode: str) -> None:
         approved, reason = await risk_engine.pre_trade_check(signal, mode, balance)
         if not approved:
             logger.info(f"Risk check rejected: {reason}")
-            return
+            signal.reasoning = f"[Risk] {reason}"
+            return signal
 
         # Save signal to DB
         signal_id = await _save_signal(signal, mode, adjusted_confidence)
@@ -162,9 +236,12 @@ async def _run_analysis_cycle(mode: str) -> None:
                 )
             logger.info(f"Signal sent for approval: {signal_id}")
 
+        return signal
+
     except Exception as e:
         logger.exception(f"Analysis cycle error: {e}")
         # Don't crash main loop
+        return None
 
 
 async def _save_signal(signal: TradingSignal, mode: str, adjusted_confidence: int) -> str:
@@ -271,13 +348,9 @@ async def main() -> None:
         analysis_trigger = mode_cfg.get("analysis_trigger", "interval")
         interval_minutes = mode_cfg.get("interval_minutes", 240)
 
-        async def analysis_job():
-            current_mode = await get_current_mode()
-            await _run_analysis_cycle(current_mode)
-
         if analysis_trigger == "interval" and interval_minutes:
             _scheduler.add_job(
-                analysis_job,
+                _analysis_job_fn,
                 trigger="interval",
                 minutes=interval_minutes,
                 id="analysis",
@@ -321,14 +394,8 @@ async def main() -> None:
 
         # WebSocket feed for scalp mode
         if mode == "scalp":
-            from bot.data.websocket_feed import CandleBuffer
-
-            async def ws_task():
-                buf = CandleBuffer("XAUUSDT", "1m")
-                await buf.start()
-
-            ws = asyncio.create_task(ws_task(), name="websocket")
-            tasks.append(ws)
+            _ws_task = asyncio.create_task(_ws_analysis_task(), name="websocket")
+            tasks.append(_ws_task)
             logger.info("WebSocket feed started for scalp mode")
 
         # ----------------------------------------------------------------

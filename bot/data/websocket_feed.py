@@ -1,5 +1,6 @@
 from collections import deque
 from binance import BinanceSocketManager
+from typing import Callable
 import asyncio
 import pandas as pd
 
@@ -23,6 +24,7 @@ class CandleBuffer:
         self.buffer: deque = deque(maxlen=maxlen)
         self._callback = None
         self._task: asyncio.Task | None = None
+        self.on_close: Callable | None = None  # no-arg callback fired on each closed candle
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -85,6 +87,9 @@ class CandleBuffer:
             "volume": float(k["v"]),
         }
         self.buffer.append(candle)
+
+        if self.on_close:
+            self.on_close()
 
         if self._callback and len(self.buffer) >= 20:
             df = pd.DataFrame(list(self.buffer)).set_index("open_time")

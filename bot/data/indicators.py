@@ -54,8 +54,10 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # ── SuperTrend ────────────────────────────────────────────────────────────
     st = ta.supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3.0)
     if st is not None and not st.empty:
-        df["supertrend"] = st["SUPERT_10_3.0"]
-        df["supertrend_dir"] = st["SUPERTd_10_3.0"]
+        st_col  = next((c for c in st.columns if c.startswith("SUPERT_") and not c.startswith("SUPERTd") and not c.startswith("SUPERTl") and not c.startswith("SUPERTs")), None)
+        std_col = next((c for c in st.columns if c.startswith("SUPERTd_")), None)
+        df["supertrend"]     = st[st_col]  if st_col  else float("nan")
+        df["supertrend_dir"] = st[std_col] if std_col else float("nan")
     else:
         df["supertrend"] = float("nan")
         df["supertrend_dir"] = float("nan")
@@ -65,11 +67,15 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vwap"] = ta.vwap(df["high"], df["low"], df["close"], df["volume"])
 
     # ── Bollinger Bands ───────────────────────────────────────────────────────
+    # Column name format varies by pandas_ta version (e.g. "BBU_20_2.0" vs "BBU_20_2")
     bb = ta.bbands(df["close"], length=20, std=2.0)
     if bb is not None and not bb.empty:
-        df["bb_upper"] = bb["BBU_20_2.0"]
-        df["bb_mid"] = bb["BBM_20_2.0"]
-        df["bb_lower"] = bb["BBL_20_2.0"]
+        upper_col = next((c for c in bb.columns if c.startswith("BBU_")), None)
+        mid_col   = next((c for c in bb.columns if c.startswith("BBM_")), None)
+        lower_col = next((c for c in bb.columns if c.startswith("BBL_")), None)
+        df["bb_upper"] = bb[upper_col] if upper_col else float("nan")
+        df["bb_mid"]   = bb[mid_col]   if mid_col   else float("nan")
+        df["bb_lower"] = bb[lower_col] if lower_col else float("nan")
     else:
         df["bb_upper"] = float("nan")
         df["bb_mid"] = float("nan")

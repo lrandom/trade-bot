@@ -47,12 +47,26 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     """Trigger immediate analysis cycle."""
     if not _is_authorized(update):
         return
-    await update.message.reply_text("🔍 Triggering analysis... Please wait.")
-    # The orchestrator exposes a function to run one analysis cycle.
-    # Imported lazily to avoid circular imports.
+    await update.message.reply_text("🔍 Đang phân tích... Vui lòng chờ.")
     try:
         from bot.orchestrator import trigger_analysis
-        await trigger_analysis()
+        signal = await trigger_analysis()
+
+        if signal is None:
+            # Blocked by pre-LLM filter (ATR spike, etc.)
+            await update.message.reply_text(
+                "⚡ *Analysis bị chặn bởi pre-filter*\n"
+                "ATR spike hoặc volatility quá cao. Thử lại sau.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        elif signal.action == "HOLD":
+            await update.message.reply_text(
+                f"📊 *Kết quả: HOLD*\n\n"
+                f"Lý do: {signal.reasoning[:300]}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        # BUY/SELL: đã được gửi riêng qua send_signal_for_approval hoặc auto-executed
+
     except ImportError:
         await update.message.reply_text("⚠️ Analysis engine not ready yet.")
     except Exception as e:
@@ -89,14 +103,35 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         from bot.data.binance_client import get_client
         client = await get_client()
         account = await client.futures_account()
-        balance = float(account.get("totalWalletBalance", 0))
+        total = float(account.get("totalWalletBalance", 0))
         unrealized = float(account.get("totalUnrealizedProfit", 0))
+        margin_balance = float(account.get("totalMarginBalance", 0))
         available = float(account.get("availableBalance", 0))
+
+        # Per-asset breakdown (non-zero balances only)
+        assets = account.get("assets", [])
+        asset_lines = []
+        for a in assets:
+            wb = float(a.get("walletBalance", 0))
+            if wb > 0:
+                symbol = a.get("asset", "?")
+                unrealized_asset = float(a.get("unrealizedProfit", 0))
+                asset_lines.append(
+                    f"  `{symbol}`: {wb:,.4f}"
+                    + (f" (PnL: {unrealized_asset:+,.2f})" if abs(unrealized_asset) > 0.001 else "")
+                )
+
+        assets_text = "\n".join(asset_lines) if asset_lines else "  _(no assets)_"
+        testnet_tag = " `[TESTNET]`" if settings.binance_testnet else ""
+
         text = (
-            f"💰 *Account Balance*\n\n"
-            f"Total:     `${balance:,.2f}`\n"
-            f"Unrealized: `${unrealized:+,.2f}`\n"
-            f"Available: `${available:,.2f}`"
+            f"💰 *Futures Account Balance*{testnet_tag}\n\n"
+            f"Wallet Total:  `${total:,.2f}`\n"
+            f"Margin Balance:`${margin_balance:,.2f}`\n"
+            f"Unrealized:    `${unrealized:+,.2f}`\n"
+            f"Available:     `${available:,.2f}`\n\n"
+            f"*Assets (Futures wallet):*\n{assets_text}\n\n"
+            f"⚠️ _Spot wallet không hiển thị ở đây._"
         )
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -107,6 +142,7 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         return
     from bot.modes.manager import get_current_mode, set_mode
+    from bot.modes.config import get_mode_config
     args = context.args
     if not args:
         mode = await get_current_mode()
@@ -118,8 +154,19 @@ async def cmd_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     new_mode = args[0].lower()
     try:
         await set_mode(new_mode)
+
+        # Apply scheduler/WebSocket changes immediately
+        try:
+            from bot.orchestrator import apply_mode_switch
+            interval_info = await apply_mode_switch(new_mode)
+        except Exception:
+            interval_info = "(restart bot để áp dụng scheduler)"
+
+        mode_cfg = get_mode_config(new_mode)
         await update.message.reply_text(
-            f"✅ Mode changed to `{new_mode}`",
+            f"✅ Mode → `{new_mode}`\n"
+            f"Leverage: `{mode_cfg['leverage']}x` | Risk: `{mode_cfg['risk_pct']}%/lệnh`\n"
+            f"Lịch: `{interval_info}`",
             parse_mode=ParseMode.MARKDOWN,
         )
     except ValueError as e:
@@ -200,16 +247,18 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not _is_authorized(update):
         return
     try:
+        # Live/testnet: show all trades (open + closed) ordered by open time
         rows = await db_fetchall(
-            """SELECT side, entry, close_price, pnl FROM trades
-               WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 10"""
+            """SELECT side, entry, close_price, pnl, status, opened_at FROM trades
+               ORDER BY opened_at DESC LIMIT 10"""
         )
         trades = [dict(r) for r in (rows or [])]
         if not trades:
-            # Fallback to paper_orders (uses pnl_usd and close_time columns)
+            # Paper mode fallback: paper_orders table
             rows = await db_fetchall(
-                """SELECT side, entry, close_price, pnl_usd AS pnl FROM paper_orders
-                   WHERE status IN ('closed', 'stopped') ORDER BY close_time DESC LIMIT 10"""
+                """SELECT side, entry, close_price, pnl_usd AS pnl, status,
+                          open_time AS opened_at FROM paper_orders
+                   ORDER BY open_time DESC LIMIT 10"""
             )
             trades = [dict(r) for r in (rows or [])]
         text = format_history(trades)

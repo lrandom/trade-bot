@@ -72,14 +72,21 @@ def format_status(positions: list, mode: str, auto_trade: bool, paper: bool) -> 
 def format_history(trades: list) -> str:
     """Format last 10 trades for /history command."""
     if not trades:
-        return "No closed trades yet."
-    lines = ["📈 *Trade History (last 10)*\n"]
+        return "📭 Chưa có lệnh nào được thực thi.\n\nBot chỉ lưu lệnh do bot tự đặt qua signal. Lệnh đặt thủ công trên Binance sẽ không hiện ở đây."
+    lines = ["📈 *Lịch sử lệnh (10 gần nhất)*\n"]
     for t in trades:
         side = t.get("side", "?")
-        entry = t.get("entry", 0)
-        close = t.get("close_price", 0)
-        pnl = t.get("pnl", 0)
-        emoji = "✅" if pnl > 0 else "❌"
-        pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
-        lines.append(f"{emoji} {side} ${entry:,.0f}→${close:,.0f} | {pnl_str}")
+        entry = float(t.get("entry") or 0)
+        close = t.get("close_price")
+        pnl = t.get("pnl")
+        status = t.get("status", "open")
+
+        if close and pnl is not None:
+            pnl = float(pnl)
+            emoji = "✅" if pnl >= 0 else "❌"
+            pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+            lines.append(f"{emoji} {side} ${entry:,.0f}→${float(close):,.0f} | {pnl_str}")
+        else:
+            # Open or not yet closed
+            lines.append(f"🟡 {side} ${entry:,.0f} | `{status.upper()}`")
     return "\n".join(lines)
