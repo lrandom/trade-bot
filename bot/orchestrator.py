@@ -1,0 +1,388 @@
+"""bot/orchestrator.py
+---------------------
+Main event loop orchestration. Wires all components together.
+
+Startup sequence:
+    1. Load settings + logger
+    2. init_db()
+    3. Connect Binance client
+    4. Read mode from DB
+    5. Build LLMEngine + RiskEngine
+    6. Build Telegram Application
+    7. Start APScheduler (analysis_job + daily_reset)
+    8. Start position_monitor_loop task
+    9. If scalp: start websocket task
+    10. Start Telegram polling
+    11. Await shutdown_event
+    12. Graceful shutdown
+"""
+
+from __future__ import annotations
+
+import asyncio
+import signal
+import sys
+import uuid
+from datetime import datetime
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from loguru import logger
+
+from bot.config import settings
+from bot.data.binance_client import get_client, close_client
+from bot.data.macro import get_macro_context
+from bot.data.snapshot import build_snapshot
+from bot.database import init_db, db_execute, db_fetchone
+from bot.filters import FilterChain
+from bot.health.monitor import HealthMonitor
+from bot.llm.engine import LLMEngine
+from bot.llm.models import TradingSignal
+from bot.modes.manager import get_current_mode, get_auto_trade
+from bot.risk import RiskEngine
+from bot.telegram.bot import build_application, start_bot, stop_bot
+from bot.telegram.notifier import send_message, send_signal_for_approval
+from bot.telegram.formatters import format_signal
+from bot.trader.factory import get_trader
+from bot.trader.position_monitor import position_monitor_loop
+from bot.utils.timezone import fmt_ict, utc_now
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+_shutdown_event: asyncio.Event | None = None
+_scheduler: AsyncIOScheduler | None = None
+_health_monitor: HealthMonitor | None = None
+
+
+def _handle_signal(sig):
+    """Called by asyncio loop on SIGINT / SIGTERM."""
+    logger.info(f"Received signal {sig.name} — shutting down")
+    if _shutdown_event:
+        _shutdown_event.set()
+
+
+# ---------------------------------------------------------------------------
+# Analysis cycle
+# ---------------------------------------------------------------------------
+
+async def trigger_analysis() -> None:
+    """Called by /signal Telegram command to run one immediate cycle."""
+    mode = await get_current_mode()
+    await _run_analysis_cycle(mode)
+
+
+async def _run_analysis_cycle(mode: str) -> None:
+    """Full analysis pipeline: filter → snapshot → LLM → risk → save/execute."""
+    logger.info(f"=== Analysis cycle start | mode={mode} ===")
+
+    try:
+        # Phase 12: Pre-LLM filter (ATR spike check)
+        filter_chain = FilterChain()
+        atr_result = await filter_chain.vol_filter.check_atr_spike(mode)
+        if not atr_result.passed:
+            logger.info(f"ATR filter blocked — {atr_result.reason}")
+            return
+
+        # Build market snapshot
+        snapshot = await build_snapshot(mode)
+
+        # Run LLM chain
+        engine = LLMEngine(mode)
+        signal: TradingSignal = await engine.generate_signal(snapshot)
+
+        if signal.action == "HOLD":
+            logger.info(f"Signal: HOLD — {signal.reasoning[:80]}")
+            return
+
+        logger.info(f"Signal: {signal.action} @ {signal.entry_price} (conf={signal.confidence}%)")
+
+        # Phase 12: Post-LLM correlation filter
+        signal_dict = {
+            "action": signal.action,
+            "confidence": signal.confidence,
+            "id": "",
+        }
+        corr_result = await filter_chain.corr_filter.check_correlation(signal_dict)
+        if not corr_result.passed:
+            logger.info(f"Correlation filter blocked — {corr_result.reason}")
+            return
+        # Adjust confidence from correlation
+        adjusted_confidence = corr_result.adjusted_confidence or signal.confidence
+
+        # Risk check
+        risk_engine = RiskEngine()
+        balance = await _get_balance()
+        approved, reason = await risk_engine.pre_trade_check(signal, mode, balance)
+        if not approved:
+            logger.info(f"Risk check rejected: {reason}")
+            return
+
+        # Save signal to DB
+        signal_id = await _save_signal(signal, mode, adjusted_confidence)
+
+        # Cycle context for enriched Telegram message
+        cycle = filter_chain.get_cycle_context()
+        if asyncio.iscoroutine(cycle):
+            cycle = await cycle
+
+        # Execute or send for approval
+        auto = await get_auto_trade()
+        signal_dict_full = {
+            "action": signal.action,
+            "entry_price": signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "tp1": signal.tp1,
+            "tp2": signal.tp2,
+            "tp3": signal.tp3,
+            "confidence": adjusted_confidence,
+            "htf_bias": signal.htf_bias,
+            "reasoning": signal.reasoning,
+            "mode": mode,
+        }
+
+        if auto:
+            logger.info(f"Auto trade: executing {signal.action} signal {signal_id}")
+            from bot.trader.trade_executor import execute_signal
+            success = await execute_signal(signal_id)
+            if success:
+                await send_message(
+                    f"🤖 *Auto Trade Executed*\n"
+                    f"{signal.action} @ ${signal.entry_price:,.2f}\n"
+                    f"Confidence: {adjusted_confidence}%"
+                )
+        else:
+            # Signal mode: send for Telegram approval
+            msg_text = format_signal(signal_dict_full)
+            msg_id = await send_signal_for_approval(msg_text, signal_id)
+            if msg_id:
+                await db_execute(
+                    "UPDATE signals SET status = 'pending' WHERE id = ?",
+                    (signal_id,)
+                )
+            logger.info(f"Signal sent for approval: {signal_id}")
+
+    except Exception as e:
+        logger.exception(f"Analysis cycle error: {e}")
+        # Don't crash main loop
+
+
+async def _save_signal(signal: TradingSignal, mode: str, adjusted_confidence: int) -> str:
+    """Save TradingSignal to signals table. Returns signal ID."""
+    signal_id = str(uuid.uuid4())
+    await db_execute(
+        """INSERT INTO signals
+           (id, mode, action, entry, sl, tp1, tp2, tp3, confidence, trend_bias, reasoning, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+        (
+            signal_id, mode, signal.action,
+            signal.entry_price, signal.stop_loss,
+            signal.tp1, signal.tp2, signal.tp3,
+            adjusted_confidence, signal.htf_bias,
+            signal.reasoning,
+        )
+    )
+    return signal_id
+
+
+async def _get_balance() -> float:
+    """Fetch account balance — paper uses default, live fetches from Binance."""
+    if settings.paper_trade:
+        return 10_000.0
+    try:
+        client = await get_client()
+        account = await client.futures_account()
+        return float(account.get("availableBalance", 10_000))
+    except Exception as e:
+        logger.warning(f"Balance fetch error: {e} — using 10000 default")
+        return 10_000.0
+
+
+# ---------------------------------------------------------------------------
+# Daily reset
+# ---------------------------------------------------------------------------
+
+async def _daily_pnl_reset() -> None:
+    """Reset daily PnL and circuit breaker at 00:01 UTC."""
+    from bot.risk.circuit_breaker import reset_daily_pnl
+    await reset_daily_pnl()
+    logger.info("Daily PnL reset complete")
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+async def main() -> None:
+    """Main coroutine — initializes all components and runs the event loop."""
+    global _shutdown_event, _scheduler, _health_monitor
+
+    # Logger is already configured in bot/logger.py via module import
+    from bot.logger import setup_logger
+    setup_logger()
+
+    _shutdown_event = asyncio.Event()
+
+    # Register signal handlers (Unix only)
+    if sys.platform != "win32":
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _handle_signal, sig)
+
+    # ----------------------------------------------------------------
+    # Startup
+    # ----------------------------------------------------------------
+    logger.info("==============================================")
+    logger.info("        GOLD TRADING BOT — STARTING          ")
+    logger.info("==============================================")
+
+    try:
+        # 1. Init DB
+        await init_db()
+        logger.info("Database initialized")
+
+        # 2. Connect Binance
+        client = await get_client()
+        logger.info(f"Binance client connected (testnet={settings.binance_testnet})")
+
+        # 3. Read current mode
+        mode = await get_current_mode()
+        auto = await get_auto_trade()
+        logger.info(f"Mode: {mode} | Auto trade: {auto} | Paper: {settings.paper_trade}")
+
+        # 4. Print startup banner
+        from bot.modes.config import get_mode_config
+        mode_cfg = get_mode_config(mode)
+        logger.info(
+            f"Mode config: interval={mode_cfg.get('interval_minutes')}min | "
+            f"model={mode_cfg.get('claude_model')} | "
+            f"leverage={mode_cfg.get('leverage')}x"
+        )
+
+        # 5. Build Telegram app
+        tg_app = build_application()
+        await start_bot(tg_app)
+        logger.info("Telegram bot polling started")
+
+        # 6. APScheduler
+        _scheduler = AsyncIOScheduler(timezone="UTC")
+
+        # Analysis job
+        analysis_trigger = mode_cfg.get("analysis_trigger", "interval")
+        interval_minutes = mode_cfg.get("interval_minutes", 240)
+
+        async def analysis_job():
+            current_mode = await get_current_mode()
+            await _run_analysis_cycle(current_mode)
+
+        if analysis_trigger == "interval" and interval_minutes:
+            _scheduler.add_job(
+                analysis_job,
+                trigger="interval",
+                minutes=interval_minutes,
+                id="analysis",
+                max_instances=1,
+                coalesce=True,
+            )
+            logger.info(f"Analysis job scheduled every {interval_minutes} minutes")
+
+        # Daily reset at 00:01 UTC
+        _scheduler.add_job(
+            _daily_pnl_reset,
+            trigger="cron",
+            hour=0, minute=1,
+            id="daily_reset",
+        )
+
+        _scheduler.start()
+        logger.info("APScheduler started")
+
+        # 7. Health monitor
+        _health_monitor = HealthMonitor(scheduler=_scheduler, silent=not settings.health_verbose)
+
+        # Register heartbeat in scheduler
+        _scheduler.add_job(
+            _health_monitor.heartbeat,
+            trigger="interval",
+            minutes=settings.health_interval_min,
+            id="heartbeat",
+        )
+        logger.info(f"Health monitor heartbeat every {settings.health_interval_min} minutes")
+
+        # 8. Background tasks
+        tasks = []
+
+        # Position monitor (always running)
+        monitor_task = asyncio.create_task(
+            position_monitor_loop(_shutdown_event),
+            name="position_monitor",
+        )
+        tasks.append(monitor_task)
+
+        # WebSocket feed for scalp mode
+        if mode == "scalp":
+            from bot.data.websocket_feed import CandleBuffer
+
+            async def ws_task():
+                buf = CandleBuffer("XAUUSDT", "1m")
+                await buf.start()
+
+            ws = asyncio.create_task(ws_task(), name="websocket")
+            tasks.append(ws)
+            logger.info("WebSocket feed started for scalp mode")
+
+        # ----------------------------------------------------------------
+        # Startup notification
+        # ----------------------------------------------------------------
+        paper_str = "PAPER 📄" if settings.paper_trade else "LIVE 🔴"
+        auto_str = "ON" if auto else "OFF"
+        await send_message(
+            f"🟢 *Bot Started* — {fmt_ict(utc_now(), '%H:%M VN %d/%m/%Y')}\n"
+            f"Mode: `{mode.upper()}` | Auto: `{auto_str}` | {paper_str}\n"
+            f"Testnet: `{settings.binance_testnet}`"
+        )
+
+        logger.info("============================================")
+        logger.info(f"  Bot running | mode={mode} | paper={settings.paper_trade}")
+        logger.info("  Press Ctrl+C to stop")
+        logger.info("============================================")
+
+        # ----------------------------------------------------------------
+        # Wait for shutdown
+        # ----------------------------------------------------------------
+        await _shutdown_event.wait()
+
+    except Exception as e:
+        logger.exception(f"Fatal error in main(): {e}")
+    finally:
+        # ----------------------------------------------------------------
+        # Graceful shutdown
+        # ----------------------------------------------------------------
+        logger.info("Shutting down...")
+
+        # Cancel background tasks
+        for task in tasks if "tasks" in dir() else []:
+            task.cancel()
+
+        if "tasks" in dir() and tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Stop scheduler
+        if _scheduler and _scheduler.running:
+            _scheduler.shutdown(wait=False)
+
+        # Stop Telegram
+        if "tg_app" in dir():
+            try:
+                await send_message(f"🔴 *Bot Stopped* — {fmt_ict(utc_now(), '%H:%M VN')}")
+            except Exception:
+                pass
+            await stop_bot(tg_app)
+
+        # Close Binance connection
+        try:
+            await close_client()
+        except Exception:
+            pass
+
+        logger.info("Shutdown complete")
